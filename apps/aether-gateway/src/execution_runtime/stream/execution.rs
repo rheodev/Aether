@@ -1035,6 +1035,33 @@ fn should_refresh_stream_usage_telemetry(
         || (next_elapsed.is_some() && next_elapsed != previous_elapsed)
 }
 
+fn build_terminal_stream_telemetry(
+    stream_started_at: Instant,
+    telemetry: Option<&ExecutionTelemetry>,
+    usage_stream_telemetry: Option<&ExecutionTelemetry>,
+    upstream_bytes: u64,
+) -> ExecutionTelemetry {
+    let current_elapsed_ms = stream_started_at
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let ttfb_ms = telemetry
+        .and_then(|telemetry| telemetry.ttfb_ms)
+        .or_else(|| usage_stream_telemetry.and_then(|telemetry| telemetry.ttfb_ms));
+    let prior_elapsed_ms = telemetry
+        .and_then(|telemetry| telemetry.elapsed_ms)
+        .or_else(|| usage_stream_telemetry.and_then(|telemetry| telemetry.elapsed_ms))
+        .unwrap_or(0);
+    let elapsed_ms = current_elapsed_ms
+        .max(prior_elapsed_ms)
+        .max(ttfb_ms.unwrap_or(0));
+    ExecutionTelemetry {
+        ttfb_ms,
+        elapsed_ms: Some(elapsed_ms),
+        upstream_bytes: Some(upstream_bytes),
+    }
+}
+
 fn should_skip_direct_finalize_prefetch(
     direct_stream_finalize_kind: Option<&str>,
     content_type: Option<&str>,
@@ -2738,6 +2765,12 @@ async fn execute_stream_from_frame_stream(
                 trace_id = %trace_id_owned,
                 "gateway skipped stream report because downstream disconnected before completion"
             );
+            let terminal_telemetry = Some(build_terminal_stream_telemetry(
+                stream_started_at_for_report,
+                telemetry.as_ref(),
+                usage_stream_telemetry.as_ref(),
+                provider_stream_bytes.load(Ordering::Relaxed),
+            ));
             let usage_payload = build_stream_usage_payload(
                 trace_id_owned,
                 report_kind_owned.unwrap_or_default(),
@@ -2749,7 +2782,7 @@ async fn execute_stream_from_frame_stream(
                 &buffered_body,
                 client_body_truncated,
                 stream_terminal_summary,
-                telemetry,
+                terminal_telemetry,
             );
             record_stream_terminal_usage(
                 &state_for_report,
@@ -2781,6 +2814,12 @@ async fn execute_stream_from_frame_stream(
 
         if let Some(failure) = terminal_failure {
             record_manual_proxy_stream_error(&state_for_report, &plan_for_report).await;
+            let terminal_telemetry = Some(build_terminal_stream_telemetry(
+                stream_started_at_for_report,
+                telemetry.as_ref(),
+                usage_stream_telemetry.as_ref(),
+                provider_stream_bytes.load(Ordering::Relaxed),
+            ));
             submit_midstream_stream_failure(
                 &state_for_report,
                 &trace_id_owned,
@@ -2788,7 +2827,7 @@ async fn execute_stream_from_frame_stream(
                 direct_stream_finalize_kind_owned.as_deref(),
                 report_context_owned,
                 headers_for_report,
-                telemetry,
+                terminal_telemetry,
                 &provider_buffered_body,
                 candidate_started_unix_secs_for_report,
                 failure,
@@ -2798,6 +2837,12 @@ async fn execute_stream_from_frame_stream(
         }
 
         let should_submit_report = report_kind_owned.is_some();
+        let terminal_telemetry = Some(build_terminal_stream_telemetry(
+            stream_started_at_for_report,
+            telemetry.as_ref(),
+            usage_stream_telemetry.as_ref(),
+            provider_stream_bytes.load(Ordering::Relaxed),
+        ));
         let usage_payload = build_stream_usage_payload(
             trace_id_owned.clone(),
             report_kind_owned.unwrap_or_default(),
@@ -2809,7 +2854,7 @@ async fn execute_stream_from_frame_stream(
             &buffered_body,
             client_body_truncated,
             stream_terminal_summary,
-            telemetry,
+            terminal_telemetry,
         );
         apply_local_execution_effect(
             &state_for_report,
@@ -3312,6 +3357,7 @@ mod tests {
         .await
         .expect("first business chunk should arrive");
         assert_eq!(first.as_ref(), b"data: {\"id\":\"first\"}\n\n");
+        tokio::time::sleep(Duration::from_millis(30)).await;
         drop(body_stream);
 
         tokio::time::timeout(Duration::from_secs(1), frame_stream_dropped.notified())
@@ -3338,6 +3384,36 @@ mod tests {
         assert_eq!(
             candidates[0].error_type.as_deref(),
             Some("downstream_disconnect")
+        );
+
+        let stored_usage = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let usage = usage_repository
+                    .find_by_request_id("req-client-drop-cancels-upstream")
+                    .await
+                    .expect("usage should read");
+                if usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.status == "cancelled")
+                {
+                    break usage.expect("cancelled usage should exist");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("usage should be marked cancelled");
+        assert_eq!(stored_usage.billing_status, "pending");
+        assert_eq!(stored_usage.status_code, Some(499));
+        let first_byte_time_ms = stored_usage
+            .first_byte_time_ms
+            .expect("cancelled stream should retain first byte time");
+        let response_time_ms = stored_usage
+            .response_time_ms
+            .expect("cancelled stream should record terminal duration");
+        assert!(
+            response_time_ms > first_byte_time_ms,
+            "terminal duration should include time after the first byte"
         );
     }
 
